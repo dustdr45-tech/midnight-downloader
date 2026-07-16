@@ -1,43 +1,5 @@
 #!/usr/bin/env python3
-"""
-Midnight Downloader - Downloads everything from Telegram Saved Messages.
-
-Fixes applied vs the original draft:
-  - Duplicate detection is keyed on Telegram's own document/photo ID
-    (see get_media_key), not on filename, so it survives re-runs even
-    when two files share a display name, and never confuses two
-    distinct files that happen to be named the same.
-  - Extensions are never guessed. Files download into an isolated temp
-    folder so Telethon resolves the real filename/extension itself
-    (the sender's attached name, or Telethon's own internal logic for
-    voice notes, round videos, etc - the same resolution official
-    Telegram clients use) before being moved into place. A prior
-    version tried to guess extensions from mime type and got audio
-    files wrong (audio/ogg saved as .mp3), corrupting playback.
-  - progress_callback matches Telethon's actual call signature
-    (current, total) - Telethon does NOT pass a filename kwarg, so a
-    signature that required one would crash on every download.
-  - GetHistoryRequest pagination uses the last message's date as
-    offset_date safeguard in addition to offset_id, avoiding an infinite
-    loop if Telegram ever returns a short page in the middle of history.
-  - All Telegram/network calls wrapped so one bad message doesn't kill
-    the whole run.
-  - Telegram rate limits (FloodWaitError) are honored: the script sleeps
-    for exactly as long as Telegram asks and retries that file, instead
-    of hammering the API and marking a burst of files as failed.
-  - Downloaded file size is checked against the size Telegram reported
-    for the message; a mismatch is flagged rather than silently treated
-    as a successful download.
-  - Temp download folders live in a dedicated .download_tmp directory
-    that's wiped clean at the start of every run, so a killed process
-    (crash, power loss, OOM) can't leave partial-download debris sitting
-    in your real download folder indefinitely.
-  - Designed to run once and exit (cron calls it nightly) - no long-lived
-    event listening.
-  - Ctrl+C during an interactive run exits cleanly with a short message
-    instead of dumping a raw asyncio traceback; progress already saved
-    to the manifest is unaffected either way.
-"""
+"""Downloads all media from Telegram Saved Messages via Telethon (user account, no size limit)."""
 
 import os
 import re
@@ -46,6 +8,7 @@ import shutil
 import asyncio
 import logging
 import tempfile
+import subprocess
 from pathlib import Path
 from datetime import datetime
 
@@ -58,13 +21,8 @@ from tqdm import tqdm
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
-# IMPORTANT: load_dotenv() with no argument searches for .env starting
-# from the CURRENT WORKING DIRECTORY, not from wherever this script
-# lives. Run the script from a different folder (or let cron launch it
-# with a different cwd) and it silently finds no .env, SESSION_PATH
-# falls back to its default, and Telethon has no session file to reuse
-# -> you get asked to log in again. Pinning this to the script's own
-# directory makes it load the same .env every time, regardless of cwd.
+# .env and session are pinned to the script's own directory, not cwd,
+# so behavior is identical whether run by hand, cron, or systemd.
 SCRIPT_DIR = Path(__file__).resolve().parent
 load_dotenv(SCRIPT_DIR / ".env")
 
@@ -75,18 +33,10 @@ PHONE_NUMBER = os.getenv("PHONE_NUMBER", "")
 DOWNLOAD_DIR = Path(os.path.expanduser(os.getenv("DOWNLOAD_DIR", "~/Downloads/Telegram")))
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Same reasoning as above: default this to a fixed, absolute location
-# next to the script (not derived from DOWNLOAD_DIR's expanduser, which
-# can itself resolve differently if HOME isn't set the same way under
-# cron) so the session file is found at the same path on every run.
 SESSION_PATH = os.path.expanduser(os.getenv("SESSION_PATH") or str(SCRIPT_DIR / "session"))
 MANIFEST_PATH = DOWNLOAD_DIR / ".downloaded_manifest.json"
 LOG_PATH = DOWNLOAD_DIR / "downloader.log"
-# Dedicated subfolder for in-progress downloads. Kept separate from
-# DOWNLOAD_DIR itself (rather than creating temp dirs loose inside it)
-# so it's easy to spot and safe to wipe wholesale at the start of every
-# run - see the cleanup in download_saved_messages().
-TMP_ROOT = DOWNLOAD_DIR / ".download_tmp"
+TMP_ROOT = DOWNLOAD_DIR / ".download_tmp"  # wiped clean at the start of every run
 
 if not API_ID or not API_HASH or not PHONE_NUMBER:
     raise SystemExit(
@@ -113,13 +63,7 @@ client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 # ----------------------------------------------------------------------
 
 def sanitize_filename(name: str) -> str:
-    """Strip characters that are invalid/annoying on Linux filesystems,
-    WITHOUT touching the extension. We no longer guess extensions
-    ourselves anywhere in this file - Telethon resolves the real
-    filename (sender-provided name, or its own internal logic for
-    voice notes / round videos / etc, which correctly distinguishes
-    things like audio/ogg from audio/mpeg). This function only cleans
-    up characters that Linux filesystems dislike."""
+    """Clean filesystem-hostile characters without touching the extension."""
     stem, ext = os.path.splitext(name)
     stem = re.sub(r"[^A-Za-z0-9._\- ]", "_", stem).strip() or "file"
     ext = re.sub(r"[^A-Za-z0-9.]", "", ext)
@@ -127,9 +71,7 @@ def sanitize_filename(name: str) -> str:
 
 
 def get_media_key(msg) -> str:
-    """Stable identity for a piece of media, used for the manifest so
-    re-running the script never re-downloads the same item even if the
-    on-disk filename later changes."""
+    """Stable dedup key from Telegram's own document/photo ID, not filename."""
     document = getattr(msg.media, "document", None)
     if document is not None:
         return f"doc:{document.id}"
@@ -155,6 +97,24 @@ def human_speed(bytes_per_sec) -> str:
     if bytes_per_sec < 1024 * 1024:
         return f"{bytes_per_sec/1024:.1f} KB/s"
     return f"{bytes_per_sec/1024/1024:.1f} MB/s"
+
+
+def send_desktop_notification(title: str, message: str) -> None:
+    """Best-effort popup via notify-send. Never fatal - skipped silently if unavailable."""
+    try:
+        env = os.environ.copy()
+        uid = os.getuid()
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
+        env.setdefault("DISPLAY", ":0")
+        subprocess.run(
+            ["notify-send", title, message],
+            env=env,
+            timeout=5,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.SubprocessError, OSError, FileNotFoundError):
+        pass
 
 
 def load_manifest() -> dict:
@@ -184,7 +144,6 @@ def unique_path(path: Path) -> Path:
 
 
 async def fetch_all_messages(peer) -> list:
-    """Paginate through full Saved Messages history."""
     all_messages = []
     offset_id = 0
     limit = 100
@@ -226,11 +185,6 @@ async def download_saved_messages():
     start_time = datetime.now()
     manifest = load_manifest()
 
-    # If a previous run was killed mid-download (crash, power loss, OOM
-    # kill), leftover partial files could sit in a temp folder forever.
-    # Wiping this at the start of every run means such debris never
-    # survives more than one night, and never ends up mixed in with
-    # real completed downloads.
     if TMP_ROOT.exists():
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -270,6 +224,11 @@ async def download_saved_messages():
         await client.disconnect()
         return
 
+    send_desktop_notification(
+        "Midnight Downloader",
+        f"Starting download of {len(to_download)} new file(s)...",
+    )
+
     downloaded = 0
     failed = 0
     total_bytes = 0
@@ -295,9 +254,7 @@ async def download_saved_messages():
         last_bytes = 0
 
         def progress_callback(current, total):
-            # NOTE: Telethon calls this as progress_callback(current, total).
-            # It does NOT pass a filename argument - a signature requiring
-            # one will raise "missing 1 required positional argument".
+            # Telethon calls this as (current, total) - no filename kwarg.
             nonlocal last_tick, last_bytes
             if not total:
                 return
@@ -314,22 +271,11 @@ async def download_saved_messages():
 
         try:
             downloaded_path = None
-            # Telegram enforces rate limits on bulk downloads. If we hit
-            # one, Telethon raises FloodWaitError with exactly how long
-            # to wait - honor that and retry this file, rather than
-            # marking it failed and immediately hammering the API again
-            # on the next file (which just trips the limit repeatedly).
             max_flood_retries = 3
             for attempt in range(max_flood_retries + 1):
                 try:
-                    # Download into an isolated temp directory rather
-                    # than a path we compute ourselves. Passing a
-                    # directory (not a filename) tells Telethon to work
-                    # out the real filename on its own - the sender's
-                    # original attachment name when present, and its
-                    # own internal resolution otherwise - the same
-                    # logic official Telegram clients use. We are not
-                    # guessing extensions anywhere in this script.
+                    # Directory target (not a filename) lets Telethon
+                    # resolve the real filename/extension itself.
                     with tempfile.TemporaryDirectory(dir=TMP_ROOT) as tmp_dir:
                         downloaded_path = await client.download_media(
                             msg,
@@ -342,9 +288,6 @@ async def download_saved_messages():
                             break
 
                         downloaded_path = Path(downloaded_path)
-                        # Only clean up filesystem-hostile characters -
-                        # leave the extension exactly as Telethon
-                        # resolved it.
                         clean_name = sanitize_filename(downloaded_path.name)
                         final_path = unique_path(DOWNLOAD_DIR / clean_name)
                         shutil.move(str(downloaded_path), str(final_path))
@@ -367,10 +310,6 @@ async def download_saved_messages():
                 continue
 
             size = final_path.stat().st_size
-            # Sanity-check against the size Telegram told us to expect.
-            # A silently truncated download (dropped connection that
-            # Telethon didn't raise on) would otherwise get counted as
-            # a clean success.
             if expected_size and size != expected_size:
                 print(
                     f"  WARNING: downloaded size ({human_size(size)}) does not match "
@@ -392,14 +331,13 @@ async def download_saved_messages():
             }
             downloaded += 1
 
-        except Exception as exc:  # noqa: BLE001 - one bad message shouldn't kill the run
+        except Exception as exc:  # noqa: BLE001
             file_bar.close()
             log.error("Failed to download message %s: %s", msg.id, exc)
             print(f"  Failed: {exc}")
             failed += 1
 
         overall_bar.update(1)
-        # Persist progress incrementally so a mid-run crash doesn't lose it
         save_manifest(manifest)
 
     overall_bar.close()
@@ -421,6 +359,12 @@ async def download_saved_messages():
     print("\n" + "=" * 70)
     print(summary)
     print("=" * 70)
+
+    send_desktop_notification(
+        "Midnight Downloader - done",
+        f"{downloaded} new file(s), {human_size(total_bytes)}"
+        + (f", {failed} failed" if failed else ""),
+    )
 
     try:
         await client.send_message("me", summary)
@@ -444,12 +388,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Ctrl+C during an interactive test run (or a SIGINT forwarded
-        # from start.sh) is a normal way to stop this - it shouldn't
-        # produce a raw traceback. Progress up to this point is already
-        # safe: the manifest is saved after every completed file, and
-        # any in-progress download was still inside its temp folder
-        # (never moved into your real download folder half-finished).
         print("\nStopped by user - progress so far has been saved.")
-        raise SystemExit(130)  # conventional exit code for SIGINT
-
+        raise SystemExit(130)
