@@ -172,6 +172,10 @@ After=network-online.target
 Type=oneshot
 User=${target_user}
 WorkingDirectory=${project_dir}
+# network-online.target ordering above mainly helps at boot - it isn't
+# reliably re-checked after a resume-from-suspend wake, so this buffer
+# gives Wi-Fi a moment to reconnect regardless of that ordering.
+ExecStartPre=/bin/sleep 15
 ExecStart=${project_dir}/$(basename "$0") run
 EOF
 

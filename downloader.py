@@ -175,6 +175,23 @@ async def fetch_all_messages(peer) -> list:
 # Main download routine
 # ----------------------------------------------------------------------
 
+async def connect_with_retries(max_attempts: int = 6, base_delay: int = 10) -> None:
+    """Retry the initial connection with backoff. A scheduled wake from
+    suspend can fire before Wi-Fi/network has reconnected - Telethon's
+    own built-in retry only spans a few seconds, not long enough for that."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await client.start(phone=PHONE_NUMBER)
+            return
+        except (ConnectionError, OSError) as exc:
+            if attempt == max_attempts:
+                raise
+            delay = base_delay * attempt
+            print(f"Connection attempt {attempt} failed ({exc}) - retrying in {delay}s...")
+            log.warning("Connection attempt %s failed: %s - retrying in %ss", attempt, exc, delay)
+            await asyncio.sleep(delay)
+
+
 async def download_saved_messages():
     print("\n" + "=" * 70)
     print("STARTING MIDNIGHT DOWNLOADER")
@@ -189,7 +206,7 @@ async def download_saved_messages():
         shutil.rmtree(TMP_ROOT, ignore_errors=True)
     TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-    await client.start(phone=PHONE_NUMBER)
+    await connect_with_retries()
     me = await client.get_me()
     print(f"Connected as: {me.first_name} (@{me.username})\n")
 
