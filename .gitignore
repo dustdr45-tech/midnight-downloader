@@ -1,0 +1,19 @@
+# Secrets - never commit these
+.env
+*.session
+*.session-journal
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Generated at runtime - not part of the project itself
+cron.log
+downloader.log
+.downloaded_manifest.json
+.download_tmp/
+
+# Don't accidentally commit your actual downloaded files if DOWNLOAD_DIR
+# ever points inside this repo
+Downloads/
